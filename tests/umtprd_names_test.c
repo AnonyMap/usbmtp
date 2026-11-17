@@ -21,6 +21,13 @@ int main(void)
 	expect("MAIN.LUA", 1);
 	expect("Dune.sdr", 1);
 	expect("Dune.SDR", 1);
+	/* vfat drops trailing dots and spaces, so these are stored as the above */
+	expect("x.lua.", 1);
+	expect("x.lua ", 1);
+	expect("Book.sdr ", 1);
+	expect("Book.SDR. .", 1);
+	expect(" ", 1);
+	expect("Dune.epub.", 0);
 	/* hidden files */
 	expect(".hidden", 1);
 	expect(".DS_Store", 1);

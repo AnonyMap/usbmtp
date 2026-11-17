@@ -41,7 +41,7 @@ if [ "${HAD_STATE}" = "no" ]; then
     log "If stock USB misbehaves afterwards, reboot the Kindle."
 fi
 
-cp -f "${KMTP_DLOG}" "${KMTP_SRC}/umtprd-last.log" 2>/dev/null
+[ -f "${KMTP_DLOG}" ] && redact_serial <"${KMTP_DLOG}" >"${KMTP_SRC}/umtprd-last.log" 2>/dev/null
 if ! teardown; then
     list_received
     sync

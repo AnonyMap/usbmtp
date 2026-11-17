@@ -54,5 +54,5 @@ body:
       label: Logs
       description: |
         Exit KOReader, then copy these two files from koreader/plugins/usbmtp.koplugin/mtp/ on the Kindle and paste or attach them:
-        mtp.log and umtprd-last.log. (They contain file paths and the Kindle's USB serial number, nothing else.)
+        mtp.log and umtprd-last.log. (They list file names from the Kindle; its serial number is hidden. Remove any names you'd rather not share.)
       render: text

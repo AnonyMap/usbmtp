@@ -9,9 +9,11 @@ running. After the computer ejects it, import() copies what's on it into
 documents/ and wipe() empties it for next time.
 
   Drive.create(path)        -> true | nil, err   (SIZE_MB, formatted; takes a while)
-  Drive.pending(path)       -> number of files waiting on the drive (or nil, err)
+  Drive.pending(path)       -> number of files on the drive not yet added (or nil, err)
   Drive.import(path, opts)  -> result | nil, err [, "dirty"]
-        result = { added = {us paths}, same = n, empty = n, skipped = n, failed = { {name=, err=} } }
+        result = { added = {us paths}, same = n, empty = n, skipped = n, owned = n,
+                   failed = { {name=, err=} } }
+        owned: .lua files and .sdr folders, which are never copied (KOReader runs/reads them)
         "dirty": the computer didn't eject it, so nothing was touched; the books
         wait on the drive until it's ejected properly
         opts.before_replace(us_path)  called before an existing file is overwritten
@@ -85,15 +87,6 @@ function Drive.create(path, free_space)
     return true
 end
 
-function Drive.pending(path)
-    local vol, err = Fat.open(path)
-    if not vol then return nil, err end
-    local list
-    list, err = vol:list()
-    vol:close()
-    if not list then return nil, err end
-    return #list
-end
 
 local function sameContent(a, b, size)
     local fa, fb = io.open(a, "rb"), io.open(b, "rb")
@@ -107,6 +100,57 @@ local function sameContent(a, b, size)
     if fa then fa:close() end
     if fb then fb:close() end
     return same
+end
+
+-- vfat drops trailing dots and spaces from names it stores ("x.lua." is saved
+-- as "x.lua"), so names are judged, and written, the way they'll end up.
+local function vfatName(name)
+    return (name:gsub("[%. ]+$", ""))
+end
+
+-- KOReader's own files: it runs the Lua in settings and in each book's .sdr
+-- folder, and an old .sdr would replace a book's reading progress and
+-- highlights. A drive, whoever wrote it, never supplies these.
+local function koreaderOwned(rel)
+    for part in rel:gmatch("[^/]+") do
+        local l = part:lower()
+        if l:match("%.sdr$") or l:match("%.lua$") then return true end
+    end
+    return false
+end
+
+-- What an import that stopped part-way already added (path + size), so the
+-- next one doesn't put back a book that was since changed or deleted on the
+-- Kindle. Kept next to the image until the drive is emptied.
+local function importedListPath(path) return path .. ".imported" end
+
+local function readImported(path)
+    local done = {}
+    local f = io.open(importedListPath(path), "r")
+    if f then
+        for line in f:lines() do
+            local size, rel = line:match("^(%d+)\t(.+)$")
+            if rel then done[rel .. "\0" .. size] = true end
+        end
+        f:close()
+    end
+    return done
+end
+
+-- Files on the drive not yet added to the Kindle (an import that stopped
+-- part-way may have added some).
+function Drive.pending(path)
+    local vol, err = Fat.open(path)
+    if not vol then return nil, err end
+    local list
+    list, err = vol:list()
+    vol:close()
+    if not list then return nil, err end
+    local done, n = readImported(path), 0
+    for _, file in ipairs(list) do
+        if not done[file.path .. "\0" .. file.size] then n = n + 1 end
+    end
+    return n
 end
 
 function Drive.import(path, opts)
@@ -125,9 +169,16 @@ function Drive.import(path, opts)
     -- People coming from the stock USB mode may well drop a "documents" folder on
     -- it. That can make two files land on the same name (vfat ignores case), so the
     -- later one gets " (2)".
-    local plan, taken, need = {}, {}, 0
+    local plan, taken, need, owned = {}, {}, 0, 0
+    local done = readImported(path)
     for i, file in ipairs(list) do
-        local rel = file.path:gsub("^[Dd][Oo][Cc][Uu][Mm][Ee][Nn][Tt][Ss]/", "")
+        local parts = {}
+        for part in file.path:gmatch("[^/]+") do parts[#parts + 1] = vfatName(part) end
+        local rel = table.concat(parts, "/"):gsub("^[Dd][Oo][Cc][Uu][Mm][Ee][Nn][Tt][Ss]/", "")
+        if koreaderOwned(rel) or rel == "" or rel:find("//", 1, true) then
+            owned = owned + 1
+            goto continue
+        end
         local dest = Drive.BOOKS .. "/" .. rel
         local n = 1
         while taken[dest:lower()] do
@@ -136,9 +187,12 @@ function Drive.import(path, opts)
             dest = Drive.BOOKS .. "/" .. (stem and (stem .. " (" .. n .. ")" .. ext) or (rel .. " (" .. n .. ")"))
         end
         taken[dest:lower()] = true
-        plan[#plan + 1] = { file = file, dest = dest, index = i }
+        plan[#plan + 1] = { file = file, dest = dest, index = i, key = file.path .. "\0" .. file.size }
         local existing = lfs.attributes(dest)
-        if not (existing and existing.size == file.size) then need = need + file.size end
+        if not (existing and existing.size == file.size) and not done[plan[#plan].key] then
+            need = need + file.size
+        end
+        ::continue::
     end
     local avail = (opts.free_space or defaultFreeSpace)(Drive.BOOKS)
     if avail and need > 0 and avail < need + 8 * Drive.MB then
@@ -170,9 +224,19 @@ function Drive.import(path, opts)
         return "added"
     end
 
-    local result = { added = {}, same = 0, empty = 0, skipped = skipped or 0, failed = {} }
+    local result = { added = {}, same = 0, empty = 0, skipped = skipped or 0, owned = owned, failed = {} }
+    local log = io.open(importedListPath(path), "a")
     for _, p in ipairs(plan) do
-        local status, e = importOne(p)
+        local status, e
+        if done[p.key] then
+            status = "same" -- added by an earlier import; may have been changed or deleted since
+        else
+            status, e = importOne(p)
+            if (status == "added" or status == "same") and log then
+                log:write(p.file.size, "\t", p.file.path, "\n")
+                log:flush()
+            end
+        end
         if status == "added" then
             result.added[#result.added + 1] = Drive.usPath(p.dest)
         elseif status == "same" then
@@ -184,6 +248,7 @@ function Drive.import(path, opts)
         end
     end
     vol:close()
+    if log then log:close() end
     table.sort(result.added)
     return result
 end
@@ -191,11 +256,14 @@ end
 -- Remove the drive (and a half-created one).
 function Drive.erase(path)
     os.remove(path .. ".part")
+    os.remove(importedListPath(path))
     return os.remove(path)
 end
 
 function Drive.wipe(path)
-    return Fat.format(path)
+    local ok, err = Fat.format(path)
+    if ok then os.remove(importedListPath(path)) end
+    return ok, err
 end
 
 return Drive

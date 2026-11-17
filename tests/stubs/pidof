@@ -1,3 +1,8 @@
 #!/bin/sh
-[ "$1" = "volumd" ] && [ -e /tmp/kmtp-test/fake/volumd_pid ] && cat /tmp/kmtp-test/fake/volumd_pid
-exit 0
+# Like pidof: the pids, or exit 1 when there are none.
+F=/tmp/kmtp-test/fake
+case "$1" in
+    volumd) [ -e "$F/volumd_pid" ] && cat "$F/volumd_pid" && exit 0 ;;
+    luajit) [ -e "$F/luajit_pid" ] && cat "$F/luajit_pid" && exit 0 ;;
+esac
+exit 1

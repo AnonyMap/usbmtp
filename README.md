@@ -60,8 +60,8 @@ After this, the plugin can update itself over Wi-Fi (see [Updating](#updating)).
 Start it from **Tools → USB file transfer → Start USB file transfer**. You can also:
 - **Start it when plugged in:** in the same menu, set *When plugged into a computer* to **ask
   first** or **start automatically**. Wall chargers are ignored.
-- **Use a gesture:** Settings → Taps and gestures → Gesture manager → *General* → **Toggle USB
-  file transfer**.
+- **Use a gesture:** Settings → Taps and gestures → Gesture manager → *General* → **USB file
+  transfer (start, or show / stop)**.
 
 While it's on, a window shows the status:
 - **Stop** ends it. Then you can unplug.
@@ -211,7 +211,8 @@ running. So:
 - Only use **start automatically** with computers you trust. The default does nothing until you
   tap Start.
 - For a computer you don't trust, use **USB drive**. That computer only sees an empty drive and
-  can't touch anything already on the Kindle.
+  can't touch anything already on the Kindle. `.lua` files and `.sdr` folders it puts on the
+  drive are never copied to the Kindle.
 
 The plugin also limits what a computer can do over MTP:
 - **No `.lua` files, `.sdr` folders or hidden files.** The computer can't create these, rename
@@ -243,7 +244,8 @@ rather than a public issue.
   the Kindle.
 - **Details:** **Status / diagnostics** in the plugin's menu shows the current state and recent
   log lines. The full logs are `mtp.log` and `umtprd-last.log` in
-  `koreader/plugins/usbmtp.koplugin/mtp/`.
+  `koreader/plugins/usbmtp.koplugin/mtp/` (`mtp.log.1` is the session before). They hide the
+  Kindle's serial number but do list file names.
 - **Linux:** [`tools/host-check.sh`](tools/host-check.sh) shows whether the computer sees the
   Kindle and which program is holding it.
 

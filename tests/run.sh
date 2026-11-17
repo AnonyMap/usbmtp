@@ -98,8 +98,16 @@ expect_not "teardown order safe for Linux 4.1 FunctionFS" "$o" "ORDER-VIOLATION"
 expect "stock driver restored with exact settings (incl. a value with spaces)" "$o" 'insmod <.*/g_mass_storage.ko> .*<iProduct="Amazon Kindle">' '<removable=Y>'
 
 V="$(tr -d ' \n' < "${REPO}/usbmtp.koplugin/mtp/VERSION")"
-expect "version stamped and shown" "$o" "version in umtprd.conf: firmware_version \"usbmtp ${V}\"" "^version: *${V}" "USB serial: *G000AB12CD34EF56"
+expect "version stamped and shown" "$o" "version in umtprd.conf: firmware_version \"usbmtp ${V}\"" "^version: *${V}" "USB serial: *<serial>"
 expect "reports the Kindle's own serial" "$o" 'serial in umtprd.conf: serial "G000AB12CD34EF56"' "serial in gadget: G000AB12CD34EF56"
+fresh_plugin; o="$(ns : sh -c "M=${PLUG}/usbmtp.koplugin/mtp
+    for i in 1 2; do sh \$M/mtp-start.sh >/dev/null; sh \$M/mtp-status.sh >/tmp/kmtp-test/status\$i; sh \$M/mtp-stop.sh >/dev/null; done
+    echo \"serial in logs or status: \$(cat \$M/mtp.log \$M/mtp.log.1 \$M/umtprd-last.log /tmp/kmtp-test/status1 /tmp/kmtp-test/status2 | grep -c G000AB12CD34EF56)\"
+    echo \"umtprd log: \$(cat \$M/umtprd-last.log /tmp/kmtp-test/status1 | grep -c 'config: serial \\\"<serial>\\\"')\"
+    echo \"status: \$(grep -c '^USB serial: *<serial>' /tmp/kmtp-test/status2)\"
+    echo \"previous log kept: \$(grep -c 'MTP is ON' \$M/mtp.log.1)\"")"
+expect "the Kindle's serial stays out of the logs and the status report" "$o" "serial in logs or status: 0" "umtprd log: 2" "status: 1"
+expect "  the previous session's log is kept as mtp.log.1" "$o" "previous log kept: [1-9]"
 fresh_plugin; o="$(ns : sh -c "sh ${PLUG}/usbmtp.koplugin/mtp/mtp-start.sh >/dev/null; sed -i '/^GMS_PARAM=/d' /var/tmp/kmtp/state; echo 'GMS_PARAMS=idVendor=6473 removable=Y' >> /var/tmp/kmtp/state; sh ${PLUG}/usbmtp.koplugin/mtp/mtp-stop.sh; cat /tmp/kmtp-test/fake/argv")"
 expect "restores state saved by v0.5 (old one-line format)" "$o" "MTP is OFF" 'insmod <.*/g_mass_storage.ko> <idVendor=6473> <removable=Y>'
 # The stock driver must never come back exporting the storage the Kindle still has mounted.
@@ -140,6 +148,9 @@ expect "drive mode: stop unloads it and restores the stock driver exactly" "$o" 
 o="$(drive_case : /mnt/us/koreader/usbmtp-drive.img)"
 expect "drive mode: refuses an image on the /mnt/us FUSE view (nothing changed)" "$o" "must be under /mnt/base-us" "start exit=1 lun=\[\]"
 expect_not "  (stock driver untouched)" "$o" "^rmmod <g_mass_storage>"
+o="$(drive_case 'mkdir -p /var/tmp/kmtp && mount -t tmpfs -o size=4k tmpfs /var/tmp/kmtp && cat /dev/zero >/var/tmp/kmtp/fill 2>/dev/null')"
+expect "no room to save the state (/var/tmp full): refuses before changing anything" "$o" "Not enough free memory to start" "start exit=1 lun=\[\]"
+expect_not "  (stock driver untouched)" "$o" "^rmmod <g_mass_storage>"
 o="$(drive_case 'touch $F/fail_drive_insmod')"
 expect "drive mode: driver won't load -> rolled back to stock" "$o" "could not load the USB drive driver" "rolled back; stock USB restored" "start exit=1 lun=\[\]"
 fresh_plugin; o="$(ns "mkdir -p /mnt/base-us/koreader; truncate -s 1M ${IMG}" sh -c "M=${PLUG}/usbmtp.koplugin/mtp
@@ -154,6 +165,12 @@ fresh_plugin; o="$(ns 'echo "g_ether 1 0 - Live 0x0" >> $F/proc/modules; sed -i 
 expect "Reset leaves USBNetwork alone" "$o" "MTP is not active. Nothing to do."
 fresh_plugin; o="$(ns : sh "${H}/scenarios/scripts-watcher.sh")"
 expect "crash watcher stops MTP when KOReader dies" "$o" "MTP is ON" "watcher: process" "state: gone" "modules:.*g_mass_storage"
+VRUN='touch $F/launcher_resumes_volumd' 
+fresh_plugin; o="$(ns "${VRUN}" sh "${H}/scenarios/scripts-watcher.sh")"
+expect "  volumd resumed after the teardown" "$o" "watcher: resumed volumd" "state: gone"
+fresh_plugin; o="$(ns "${VRUN}; echo 4242 > \$F/luajit_pid" sh "${H}/scenarios/scripts-watcher.sh")"; kill -CONT 999 2>/dev/null
+expect "  KOReader started again meanwhile: volumd left paused for it" "$o" "leaving volumd paused" "state: gone"
+expect_not "  (not resumed)" "$o" "resumed volumd"
 
 run_start() { fresh_plugin; ns "$1" sh "${H}/scenarios/scripts-start-only.sh"; }
 o="$(run_start 'touch $F/umtprd_fail')"
@@ -161,25 +178,27 @@ expect "daemon fails -> rollback" "$o" "umtprd exited during startup" "rolled ba
 o="$(run_start 'echo "999 (volumd) S 1 1" > $F/proc/999/stat')"
 expect "refuses when volumd runs" "$o" "volumd is running" "start exit=1"
 o="$(run_start 'echo /dev/loop/0 > /sys/devices/soc0/ci_hdrc.0/gadget/lun0/file')"
-expect "refuses while stock USB exports" "$o" "exporting storage right now"
+expect "refuses while stock USB exports" "$o" "shared as a USB drive right now"
 o="$(run_start 'echo 4.9.77-lab126 > $F/kernel')"
-expect "refuses on other kernels" "$o" "built for kernel 4.1.15-lab126"
+expect "refuses on other kernels" "$o" "isn.t supported: it runs Linux"
 o="$(run_start 'echo "g_ether 1 0 - Live 0x0" >> $F/proc/modules')"
-expect "refuses with USBNetwork" "$o" "another USB gadget is loaded"
+expect "refuses with USBNetwork" "$o" "Another USB mode"
 o="$(run_start 'touch $F/no_usb_gadget')"
 expect "configfs missing -> g_ffs fallback" "$o" "trying legacy g_ffs" "MTP is ON (mode: gffs"
 o="$(run_start 'touch $F/no_usb_gadget $F/fail_insmod_g_ffs')"
 expect "both gadget paths fail -> rollback" "$o" "g_ffs setup failed" "rolled back; stock USB restored"
 
 fresh_plugin; o="$(ns : sh "${H}/scenarios/scripts-crash.sh")"
-expect "crash leftovers cleaned by stop" "$o" "MTP already active" "MTP is OFF. Safe to unplug."
+expect "crash leftovers cleaned by stop" "$o" "already on, or was left on" "MTP is OFF. Safe to unplug."
 fresh_plugin; o="$(ns : sh "${H}/scenarios/scripts-hung-daemon.sh")"
 expect "hung daemon force-killed" "$o" "sending SIGKILL" "MTP is OFF" "leftover umtprd procs: 0"
+fresh_plugin; o="$(ns 'touch $F/fail_insmod_with_params_g_mass_storage' sh -c "M=${PLUG}/usbmtp.koplugin/mtp; sh \$M/mtp-start.sh >/dev/null; sh \$M/mtp-stop.sh; grep 'g_mass_storage' /tmp/kmtp-test/fake/argv | tail -n 1")"
+expect "saved settings refused: the stock driver comes back with defaults, still removable" "$o" "MTP is OFF" 'insmod <.*/g_mass_storage.ko> <removable=1>$'
 fresh_plugin; o="$(ns : sh "${H}/scenarios/scripts-reload-fails.sh")"
 expect "restore failure reported" "$o" "could not reload the stock USB driver" "stock USB was not restored"
 
 echo "== plugin (Lua, with stand-in KOReader modules)"
-fresh_plugin; o="$(ns : luajit "${H}/plugin_test.lua")"
+fresh_plugin; o="$(ns : luajit "${H}/plugin_test.lua" 2>&1)"
 [ -n "${PLUGIN_LOG:-}" ] && printf '%s\n' "$o" >"${PLUGIN_LOG}"  # full output, for debugging
 printf '%s\n' "$o" | grep -E "^FAIL" | sed 's/^/    /'
 expect "plugin scenarios" "$o" " 0 failed"

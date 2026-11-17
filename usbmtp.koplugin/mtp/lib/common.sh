@@ -38,8 +38,25 @@ state_get() {
 }
 
 state_set() {
-    mkdir -p "${KMTP_RUN}"
-    echo "${1}=${2}" >>"${KMTP_STATE}"
+    # Returns 1 if it couldn't be written (e.g. /var/tmp full): callers that are
+    # about to change something must stop, or teardown won't know how to undo it.
+    mkdir -p "${KMTP_RUN}" 2>/dev/null
+    if ! echo "${1}=${2}" >>"${KMTP_STATE}" 2>/dev/null; then
+        log "ERROR: could not save the USB state (is /var/tmp full?)"
+        return 1
+    fi
+}
+
+# The Kindle's own serial, as reported over USB. Kept out of the logs, which
+# people paste into public bug reports.
+kindle_serial() {
+    _s="$(tr -dc 'A-Za-z0-9' </proc/usid 2>/dev/null | cut -c1-16)"
+    echo "${_s:-KMTP0001}"
+}
+
+redact_serial() {
+    # stdin -> stdout, with the serial replaced (it's alphanumeric, so safe in sed)
+    sed "s/$(kindle_serial)/<serial>/g"
 }
 
 mod_loaded() {
@@ -106,8 +123,11 @@ save_gms_params() {
         case "${_v}" in
             *'"'*) log "note: not restoring ${_k} (contains a double quote): ${_v}"; continue ;;
         esac
-        state_set GMS_PARAM "${_k}=${_v}"   # one per line, so values may contain spaces
-        _params="${_params} ${_k}=${_v}"
+        state_set GMS_PARAM "${_k}=${_v}" || return 1   # one per line, so values may contain spaces
+        case "${_k}" in
+            iSerialNumber) _params="${_params} ${_k}=<serial>" ;;
+            *) _params="${_params} ${_k}=${_v}" ;;
+        esac
     done
     log "saved g_mass_storage params: ${_params:- (none)}"
 }
@@ -162,6 +182,7 @@ gms_is_our_drive() {
 # Is the stock USB drive mode actively exporting storage right now?
 # Direct path first; only walk /sys/devices (slow on this CPU) if that finds no LUNs.
 gms_exporting() {
+    mod_loaded g_mass_storage || return 1 # (no LUNs without it; skips the slow /sys walk)
     _found=0
     for _f in /sys/class/udc/${UDC_NAME}/device/gadget/lun*/file; do
         [ -r "${_f}" ] || continue
@@ -211,8 +232,16 @@ stop_daemon() {
         if pid_alive "${_p}"; then
             log "umtprd did not exit, sending SIGKILL"
             kill -KILL "${_p}" 2>/dev/null
-            usleep 300000 2>/dev/null || sleep 1
         fi
+        # Until it's really gone (up to 30 s): its main thread can show as a zombie
+        # while another thread is still finishing a write and holding FunctionFS
+        # open. (Its parent, mtp-start.sh, has exited, so init reaps it as soon as
+        # every thread is done; until then the pid exists and kill -0 succeeds.)
+        _i=0
+        while kill -0 "${_p}" 2>/dev/null && [ ${_i} -lt 60 ]; do
+            usleep 500000 2>/dev/null || sleep 1
+            _i=$((_i + 1))
+        done
     fi
     # Catch strays (e.g. after a crash, pidfile lost)
     killall umtprd 2>/dev/null && { usleep 300000 2>/dev/null || sleep 1; }
@@ -240,10 +269,16 @@ teardown_gadget() {
     # 3. Unmount FunctionFS while the function instance still exists.
     if grep -q " ${FFS_MNT} functionfs" /proc/mounts; then
         log "unmounting FunctionFS"
-        if ! umount "${FFS_MNT}" 2>/dev/null; then
-            log "ERROR: could not unmount ${FFS_MNT}; leaving the gadget in place (reboot to clear)"
-            return 1
-        fi
+        _i=0
+        until umount "${FFS_MNT}" 2>/dev/null; do
+            _i=$((_i + 1))
+            if [ ${_i} -ge 5 ]; then
+                log "ERROR: USB could not be switched back (the MTP connection is still busy). Restart the Kindle to fix it."
+                log "  (could not unmount ${FFS_MNT}; leaving the gadget in place)"
+                return 1
+            fi
+            sleep 1
+        done
     fi
     rmdir "${FFS_MNT}" 2>/dev/null
 
@@ -282,7 +317,9 @@ reload_gms() {
         return
     fi
     [ $# -gt 0 ] && log "warning: reload with saved params failed, retrying with defaults"
-    modprobe g_mass_storage 2>/dev/null || insmod "${MODDIR}/legacy/g_mass_storage.ko" 2>/dev/null || return 1
+    # (removable=1: on this kernel the driver won't load without a backing file otherwise.)
+    modprobe g_mass_storage removable=1 2>/dev/null ||
+        insmod "${MODDIR}/legacy/g_mass_storage.ko" removable=1 2>/dev/null || return 1
     gms_unexport
 }
 
