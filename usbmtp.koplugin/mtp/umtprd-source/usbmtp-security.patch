@@ -124,7 +124,7 @@ index 98d6df3..1066846 100644
  }
  
 diff --git a/src/mtp_sanitize.c b/src/mtp_sanitize.c
-index d41571b..590cdf7 100644
+index d41571b..06e806d 100644
 --- a/src/mtp_sanitize.c
 +++ b/src/mtp_sanitize.c
 @@ -28,6 +28,7 @@
@@ -135,7 +135,7 @@ index d41571b..590cdf7 100644
  
  /**
   * utf8_validate()
-@@ -129,6 +130,36 @@ static int is_forbidden_ascii(unsigned char c)
+@@ -129,6 +130,43 @@ static int is_forbidden_ascii(unsigned char c)
   *
   * @return      SANITIZE_OK on success, negative error code otherwise.
   */
@@ -150,21 +150,28 @@ index d41571b..590cdf7 100644
 + *
 + * @return 1 if protected, 0 otherwise.
 + */
-+static int usbmtp_ends_with_ci(const char *s, const char *suffix)
++static int usbmtp_ends_with_ci(const char *s, size_t ls, const char *suffix)
 +{
-+	size_t ls = strlen(s), lx = strlen(suffix);
++	size_t lx = strlen(suffix);
 +	if (ls < lx)
 +		return 0;
-+	return strcasecmp(s + ls - lx, suffix) == 0;
++	return strncasecmp(s + ls - lx, suffix, lx) == 0;
 +}
 +
 +int usbmtp_protected_name(const char *name)
 +{
++	size_t len;
 +	if (!name)
 +		return 0;
 +	if (name[0] == '.')
 +		return 1;
-+	if (usbmtp_ends_with_ci(name, ".lua") || usbmtp_ends_with_ci(name, ".sdr"))
++	/* vfat drops trailing dots and spaces: "x.lua." is stored as "x.lua" */
++	len = strlen(name);
++	while (len > 0 && (name[len - 1] == '.' || name[len - 1] == ' '))
++		len--;
++	if (len == 0)
++		return 1;
++	if (usbmtp_ends_with_ci(name, len, ".lua") || usbmtp_ends_with_ci(name, len, ".sdr"))
 +		return 1;
 +	return 0;
 +}

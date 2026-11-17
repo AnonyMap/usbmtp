@@ -61,7 +61,7 @@ START IT (any of these)
     screen. Wall chargers are ignored, and so is charging that resumes
     with the cable still in (full battery topping up, or just after Stop).
   - Gesture: Settings > Taps and gestures > Gesture manager > pick a
-    gesture > General > "Toggle USB file transfer".
+    gesture > General > "USB file transfer (start, or show / stop)".
   Connection (same menu): MTP, or USB drive (see below).
 
 WHILE SHARING

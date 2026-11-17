@@ -18,11 +18,12 @@ file-name order):
   - a connected computer can't create, rename to, or write to .lua files,
     .sdr folders or hidden (dot) files: KOReader runs Lua it finds in the
     storage (settings, book metadata sidecars), so those would let a computer
-    run code as root;
+    run code as root (also when spelled "x.lua." or "Book.sdr ", which the
+    Kindle's vfat stores as "x.lua" and "Book.sdr");
   - DeleteObject refuses the storage root (handle 0), which upstream would
     empty, and "all objects" (0xFFFFFFFF);
   - GetPartialObject's size is unsigned, and a negative offset or size never
     reaches the copy (upstream: heap overflow, daemon crash).
 
 tools/build-umtprd.sh rebuilds it byte for byte. SHA-256 of bin/umtprd:
-  a7993000eb06cf61bf628634654f43ccf0405afbb2b262874c53a550bd4fcbd4
+  9134659eb5aabb22d264109fbebb45f7de6c622adbec31a8ccaeea7b827171e1

@@ -12,8 +12,17 @@ WATCH="$1"
 [ -n "${WATCH}" ] || exit 0
 trap '' HUP
 
-while [ -f "${KMTP_STATE}" ] && pid_alive "${WATCH}"; do
-    usleep 200000 2>/dev/null || sleep 1
+# Once a second, with shell builtins only (this runs for the whole session on a
+# single slow core): the process is gone when kill -0 fails, or it's a zombie
+# (kill -0 still succeeds on one, so look at its state when we can read it).
+alive() {
+    kill -0 "${WATCH}" 2>/dev/null || return 1
+    read -r _stat <"/proc/${WATCH}/stat" 2>/dev/null || return 0
+    _rest="${_stat##*) }"          # (the process name, in parentheses, can contain spaces)
+    [ "${_rest%% *}" != "Z" ]
+}
+while [ -f "${KMTP_STATE}" ] && alive; do
+    sleep 1
 done
 
 if [ -f "${KMTP_STATE}" ]; then
@@ -26,8 +35,14 @@ if [ -f "${KMTP_STATE}" ]; then
     fi
     sh "${KMTP_SRC}/mtp-stop.sh" >/dev/null 2>&1
     if [ -n "${PAUSED_VOLUMD}" ]; then
-        # shellcheck disable=SC2086
-        kill -CONT ${PAUSED_VOLUMD} 2>/dev/null
-        log "watcher: resumed volumd"
+        # Unless KOReader was started again meanwhile: its launcher paused volumd
+        # for it, and waking it would let it take USB away from the new KOReader.
+        if pidof luajit >/dev/null 2>&1; then
+            log "watcher: KOReader is running again; leaving volumd paused for it"
+        else
+            # shellcheck disable=SC2086
+            kill -CONT ${PAUSED_VOLUMD} 2>/dev/null
+            log "watcher: resumed volumd"
+        fi
     fi
 fi

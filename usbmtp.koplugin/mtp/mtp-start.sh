@@ -15,6 +15,7 @@
 # shellcheck source=lib/common.sh
 . "$(dirname "$0")/lib/common.sh"
 
+mv -f "${KMTP_LOG}" "${KMTP_LOG}.1" 2>/dev/null # (keep the previous run's log: it may record a failed stop)
 : >"${KMTP_LOG}" 2>/dev/null
 log "=== usbmtp start ($(date)) version $(cat "${KMTP_SRC}/VERSION" 2>/dev/null) ==="
 log "kernel $(uname -r), volumd: $(volumd_state), USB: $(udc_state)"
@@ -23,45 +24,44 @@ log "kernel $(uname -r), volumd: $(volumd_state), USB: $(udc_state)"
 [ "$(id -u)" = "0" ] || die "must run as root"
 
 if [ "$(uname -r)" != "${EXPECTED_KERNEL}" ] && [ "${FORCE:-0}" != "1" ]; then
-    die "built for kernel ${EXPECTED_KERNEL}, this is $(uname -r). Set FORCE=1 to try anyway."
+    die "This Kindle model isn't supported: it runs Linux $(uname -r), and the plugin is built for ${EXPECTED_KERNEL}. (Testers: FORCE=1 overrides this from a terminal.)"
 fi
 
-[ -d "/sys/class/udc/${UDC_NAME}" ] || die "USB controller ${UDC_NAME} not found"
+[ -d "/sys/class/udc/${UDC_NAME}" ] || die "This Kindle model isn't supported: its USB controller (${UDC_NAME}) wasn't found."
 DRIVE="${KMTP_DRIVE:-}"
 if [ -z "${DRIVE}" ]; then
-    [ -f "${KMTP_SRC}/bin/umtprd" ] || die "missing ${KMTP_SRC}/bin/umtprd"
-    [ -f "${MODDIR}/function/usb_f_fs.ko" ] || die "missing usb_f_fs.ko"
+    [ -f "${KMTP_SRC}/bin/umtprd" ] || die "The plugin's files are incomplete (bin/umtprd is missing). Reinstall the plugin."
+    [ -f "${MODDIR}/function/usb_f_fs.ko" ] || die "This Kindle's software lacks the USB module MTP needs (usb_f_fs.ko). The USB drive connection may still work."
 else
     case "${DRIVE}" in
         /mnt/base-us/*) ;;
         *) die "the drive image must be under /mnt/base-us (not the /mnt/us FUSE view): ${DRIVE}" ;;
     esac
-    [ -f "${DRIVE}" ] || die "missing drive image ${DRIVE}"
-    [ -f "${MODDIR}/legacy/g_mass_storage.ko" ] || die "missing g_mass_storage.ko"
+    [ -f "${DRIVE}" ] || die "The USB drive's file is missing (${DRIVE}). Start again to recreate it."
+    [ -f "${MODDIR}/legacy/g_mass_storage.ko" ] || die "This Kindle's software lacks the USB drive module (g_mass_storage.ko)."
 fi
 
 if [ -f "${KMTP_STATE}" ] || daemon_pid >/dev/null; then
-    die "MTP already active. Run mtp-stop.sh first."
+    die "USB file transfer is already on, or was left on by a crash. Use Reset USB in the plugin's menu."
 fi
 
 case "$(volumd_state)" in
     running)
-        die "volumd is running, so the stock system is managing USB. Start KOReader from KUAL (koreader.sh), or just exit KOReader and use stock USB."
+        die "The Kindle's own USB service is active, so the plugin can't take over USB. Start KOReader from KUAL (or exit KOReader and use the Kindle's normal USB mode). (volumd is running)"
         ;;
 esac
 
 if mod_loaded g_ether || mod_loaded g_ffs; then
-    die "another USB gadget is loaded (USBNetwork?). Turn it off first."
+    die "Another USB mode (such as USBNetwork) is on. Turn it off first."
 fi
 
 if gms_exporting; then
-    die "the stock USB drive mode is exporting storage right now. Eject on the computer and unplug first."
+    die "The Kindle is shared as a USB drive right now. Eject it on the computer and unplug first."
 fi
 
 # Report the Kindle's own serial (as the stock USB mode does), so Calibre and other
 # hosts can tell devices apart and remember per-device settings.
-SERIAL="$(tr -dc 'A-Za-z0-9' </proc/usid 2>/dev/null | cut -c1-16)"
-[ -n "${SERIAL}" ] || SERIAL="KMTP0001"
+SERIAL="$(kindle_serial)"
 
 # ---------- stage binaries on tmpfs ----------
 mkdir -p "${KMTP_RUN}" || die "cannot create ${KMTP_RUN}"
@@ -77,7 +77,8 @@ if [ -z "${DRIVE}" ]; then
         mv -f "${KMTP_RUN}/umtprd.conf.tmp" "${KMTP_RUN}/umtprd.conf" || die "cannot write config"
     chmod 755 "${KMTP_RUN}/umtprd"
 fi
-state_set STARTED "$(date +%s)"
+# Nothing has changed yet: if the state can't be saved (/var/tmp full), stop here.
+state_set STARTED "$(date +%s)" || die "Not enough free memory to start (could not write to /var/tmp). Restart the Kindle and try again."
 
 # Crash safety: if the caller (KOReader) dies without stopping us, stop ourselves.
 start_watcher() {
@@ -91,8 +92,8 @@ start_watcher() {
 # From here on, any failure must roll back.
 fail() {
     log "ERROR: $*"
-    [ -f "${KMTP_DLOG}" ] && { log "--- umtprd output ---"; tail -n 15 "${KMTP_DLOG}" | while read -r l; do log "  ${l}"; done; }
-    cp -f "${KMTP_DLOG}" "${KMTP_SRC}/umtprd-last.log" 2>/dev/null
+    [ -f "${KMTP_DLOG}" ] && { log "--- umtprd output ---"; tail -n 15 "${KMTP_DLOG}" | redact_serial | while read -r l; do log "  ${l}"; done; }
+    redact_serial <"${KMTP_DLOG}" >"${KMTP_SRC}/umtprd-last.log" 2>/dev/null
     log "rolling back..."
     if teardown; then
         log "rolled back; stock USB restored"
@@ -104,12 +105,12 @@ fail() {
 
 # ---------- release the controller from the stock driver ----------
 if mod_loaded g_mass_storage; then
-    state_set GMS_WAS_LOADED yes
-    save_gms_params
+    state_set GMS_WAS_LOADED yes || die "Not enough free memory to start (could not write to /var/tmp). Restart the Kindle and try again."
+    save_gms_params || die "Not enough free memory to start (could not write to /var/tmp). Restart the Kindle and try again."
     log "unloading g_mass_storage"
     rmmod g_mass_storage || fail "could not unload g_mass_storage (in use?)"
 else
-    state_set GMS_WAS_LOADED no
+    state_set GMS_WAS_LOADED no || die "Not enough free memory to start (could not write to /var/tmp). Restart the Kindle and try again."
 fi
 
 # ---------- or: share a disk image as a plain USB drive ----------
@@ -123,7 +124,7 @@ if [ -n "${DRIVE}" ]; then
     log "sharing ${DRIVE} as a USB drive"
     # Recorded first, so a teardown after any interruption knows a loaded
     # g_mass_storage is ours (teardown checks it's actually loaded).
-    state_set DRIVE_LOADED yes
+    state_set DRIVE_LOADED yes || fail "could not save the USB state"
     insmod "${MODDIR}/legacy/g_mass_storage.ko" file="${DRIVE}" removable=1 ro=0 stall=0 luns=1 \
         idVendor=0x1d6b idProduct=0x0104 iManufacturer=KOReader 'iProduct="Kindle drive"' \
         iSerialNumber="${SERIAL}" || fail "could not load the USB drive driver"

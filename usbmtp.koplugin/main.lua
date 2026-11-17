@@ -116,6 +116,11 @@ end
 -- sitting on the reader go first: they hold references to the document and
 -- would crash on the next tap once it's closed.
 local function closeReader(r)
+    -- Only ever called because the file on disk is newer than the open copy (the
+    -- computer replaced it). KOReader would otherwise save the open copy back on
+    -- close if it has unsaved changes (e.g. highlights written into a PDF),
+    -- overwriting what the computer just sent. Its annotations stay in the .sdr.
+    if r.document then r.document.is_edited = false end
     r:handleEvent(Event:new("CloseReaderMenu"))
     r:handleEvent(Event:new("CloseConfigMenu"))
     if r.highlight and r.highlight.onClose then r.highlight:onClose() end
@@ -199,13 +204,19 @@ local function showBusy(text)
     return msg
 end
 
+-- Like KOReader's KeepAlive plugin: powerd's screensaver off, and PluginShare.keepalive
+-- set too, because AutoSuspend must not reset its Kindle timer while the
+-- screensaver is disabled (it says that crashes).
 function Ctl:keepAwake(on)
     if on then
         self.prev_pause_auto_suspend = PluginShare.pause_auto_suspend
+        self.prev_keepalive = PluginShare.keepalive
         PluginShare.pause_auto_suspend = true
+        PluginShare.keepalive = true
         os.execute("lipc-set-prop com.lab126.powerd preventScreenSaver 1 >/dev/null 2>&1")
     else
         PluginShare.pause_auto_suspend = self.prev_pause_auto_suspend
+        PluginShare.keepalive = self.prev_keepalive
         if not PluginShare.keepalive then -- don't undo the KeepAlive plugin's choice
             os.execute("lipc-set-prop com.lab126.powerd preventScreenSaver 0 >/dev/null 2>&1")
         end
@@ -236,6 +247,7 @@ end
 
 function Ctl:start(mode)
     mode = mode or connMode()
+    self:closePrompt() -- (started some other way while it was up)
     if self.active then
         self:showDialog()
         return
@@ -304,14 +316,18 @@ function Ctl:start(mode)
 end
 
 -- Files that arrived during the last session (written by mtp-stop.sh).
+-- Read once: the list is about the session that just ended, so it's removed
+-- after reading (otherwise a later Reset USB would show those books as new).
 function Ctl:receivedFiles()
-    local f = io.open(self.mtp_dir .. "/received.txt", "r")
+    local path = self.mtp_dir .. "/received.txt"
+    local f = io.open(path, "r")
     if not f then return {} end
     local list = {}
     for line in f:lines() do
         if line ~= "" then list[#list + 1] = line end
     end
     f:close()
+    os.remove(path)
     table.sort(list)
     return list
 end
@@ -402,19 +418,28 @@ end
 -- summary for the message, and whether it was left for a proper eject.
 function Ctl:importDrive()
     if not fileExists(Drive.IMAGE) then return {}, nil, false end
-    local busy = showBusy(_("Adding the books from the USB drive…"))
+    local busy_text = _("Adding the books from the USB drive…")
+    local busy = showBusy(busy_text)
     self:keepAwake(true)
     local okc, res, err, why = pcall(Drive.import, Drive.IMAGE, {
         before_replace = function(us_path)
             -- A newer copy of the open book: close it before it's replaced under KOReader.
             -- (vfat ignores case, so "dune.epub" open is replaced by "Dune.epub".)
             local r = openReader()
-            if r and r.document.file:lower() == us_path:lower() then closeReader(r) end
+            if r and r.document.file:lower() == us_path:lower() then
+                closeReader(r) -- (closes whatever is on top, the busy message included)
+                UIManager:close(busy)
+                busy = showBusy(busy_text)
+            end
         end,
     })
     if not okc then res, err = nil, tostring(res) end -- (a malformed drive mustn't crash KOReader)
     local wiped, werr = false, nil
-    if res and #res.failed == 0 then wiped, werr = Drive.wipe(Drive.IMAGE) end
+    if res and #res.failed == 0 then
+        local okw
+        okw, wiped, werr = pcall(Drive.wipe, Drive.IMAGE)
+        if not okw then wiped, werr = false, wiped end
+    end
     self:keepAwake(false)
     UIManager:close(busy)
     if not res then
@@ -425,7 +450,8 @@ function Ctl:importDrive()
     end
     local books, others = splitBooks(res.added)
     local lines = {}
-    if #res.added == 0 and res.same == 0 and #res.failed == 0 and res.empty == 0 and res.skipped == 0 then
+    if #res.added == 0 and res.same == 0 and #res.failed == 0 and res.empty == 0 and res.skipped == 0
+            and res.owned == 0 then
         lines[1] = _("The USB drive was empty.")
     end
     local summary = receivedSummary(books, others)
@@ -433,6 +459,9 @@ function Ctl:importDrive()
     if res.same > 0 then lines[#lines + 1] = T(_("%1 file(s) were already on the Kindle."), res.same) end
     if res.empty > 0 then lines[#lines + 1] = T(_("%1 empty file(s) were skipped."), res.empty) end
     if res.skipped > 0 then lines[#lines + 1] = T(_("%1 hidden file(s) were skipped."), res.skipped) end
+    if res.owned > 0 then
+        lines[#lines + 1] = T(_("%1 file(s) of KOReader's own (.lua files, .sdr folders) were not copied: they could change reading progress or run code."), res.owned)
+    end
     if #res.failed > 0 then
         lines[#lines + 1] = T(_("%1 file(s) couldn't be copied and are still on the USB drive:"), #res.failed)
         for i = 1, math.min(#res.failed, 3) do
@@ -509,6 +538,28 @@ function Ctl:stop(reason, quiet)
     return ok
 end
 
+-- Books copied onto the USB drive in a session that ended before they were
+-- added (KOReader closed, or crashed): offer them now rather than leave them
+-- waiting, unseen, until the next drive session.
+function Ctl:offerLeftovers()
+    if self.active then return end
+    local okc, n = pcall(Drive.pending, Drive.IMAGE)
+    if not okc or type(n) ~= "number" or n == 0 then return end
+    UIManager:show(ConfirmBox:new{
+        text = T(_("%1 file(s) copied to the USB drive last time haven't been added to the Kindle yet.\n\nAdd them now?"), n),
+        ok_text = _("Add"),
+        cancel_text = _("Not now"),
+        ok_callback = function()
+            UIManager:nextTick(function()
+                local books, summary = self:importDrive()
+                local FileManager = package.loaded["apps/filemanager/filemanager"]
+                if FileManager and FileManager.instance then FileManager.instance:onRefresh() end
+                self:showResult(summary or "", books)
+            end)
+        end,
+    })
+end
+
 function Ctl:offerStaleCleanup()
     UIManager:show(ConfirmBox:new{
         text = _("A USB file transfer was left running (KOReader probably closed unexpectedly).\n\nStop it and restore normal USB?"),
@@ -527,7 +578,7 @@ function Ctl:dialogText()
             and _("Connected. On your computer, copy books onto the \"TO KINDLE\" drive, then eject it: the Kindle adds them to its library.")
             or _("Waiting for the computer…\nA drive called \"TO KINDLE\" will appear on it.")
         return _("USB drive is on.") .. "\n\n" .. state .. "\n\n" ..
-               _("Eject the drive on the computer before tapping Stop or unplugging, or the last book copied may be lost. Hide this to keep reading meanwhile.")
+               _("When you're done, eject the drive on the computer; that's when the books are added. (If you unplug or tap Stop first, they wait on the drive until it's ejected properly.) Hide this to keep reading meanwhile.")
     end
     local state
     if self.connected then
@@ -719,12 +770,15 @@ function Ctl:onCharging()
                 self:start()
                 return
             end
-            UIManager:show(ConfirmBox:new{
+            self:closePrompt()
+            self.prompt = ConfirmBox:new{
                 text = T(_("Computer detected.\n\nStart USB file transfer (%1)?"), modeLabel(connMode())),
                 ok_text = _("Start"),
                 flush_events_on_show = true,
-                ok_callback = function() UIManager:nextTick(function() self:start() end) end,
-            })
+                ok_callback = function() self.prompt = nil; UIManager:nextTick(function() self:start() end) end,
+                cancel_callback = function() self.prompt = nil end,
+            }
+            UIManager:show(self.prompt)
         elseif tries < 16 then
             UIManager:scheduleIn(0.5, self._probe)
         else
@@ -734,9 +788,16 @@ function Ctl:onCharging()
     UIManager:scheduleIn(1, self._probe)
 end
 
+-- The "Computer detected" prompt: only one at a time, and gone once it's moot.
+function Ctl:closePrompt()
+    if self.prompt then UIManager:close(self.prompt) end
+    self.prompt = nil
+end
+
 function Ctl:onNotCharging()
     if self._probe then UIManager:unschedule(self._probe) end
     self._probing = false
+    self:closePrompt() -- unplugged
     -- Cable pulled, or battery full? Charging only stops by itself when (nearly)
     -- full, so well below that it was the cable. Otherwise watch the USB port for a
     -- few seconds. (Charge-complete can be reported at 98-99%, hence the margin.)
@@ -771,7 +832,9 @@ function Ctl:onResume()
         self.stopped_by_sleep = false
         local ok = self.sleep_stop_ok
         UIManager:scheduleIn(1, function()
-            local text = _("USB file transfer was stopped because the Kindle went to sleep.\n\nIf a file was being copied at that moment, copy it again.")
+            local text = self.import_pending
+                and _("USB file transfer was stopped because the Kindle went to sleep.")
+                or _("USB file transfer was stopped because the Kindle went to sleep.\n\nIf a file was being copied at that moment, copy it again.")
             local books, summary = {}, nil
             local st = udcState()
             -- Only a computer that's (still) connected; on a charger it would just wait.
@@ -862,6 +925,8 @@ function UsbMtp:init()
         Ctl.stale_checked = true
         if not Ctl.active and fileExists(STATE_FILE) then
             UIManager:scheduleIn(1, function() Ctl:offerStaleCleanup() end)
+        elseif not Ctl.active and fileExists(Drive.IMAGE) then
+            UIManager:scheduleIn(1, function() Ctl:offerLeftovers() end)
         end
     end
 end
@@ -901,7 +966,7 @@ function UsbMtp:onDispatcherRegisterActions()
     Dispatcher:registerAction("usbmtp_toggle", {
         category = "none",
         event = "ToggleUsbMtp",
-        title = _("Toggle USB file transfer"),
+        title = _("USB file transfer (start, or show / stop)"),
         general = true,
     })
 end

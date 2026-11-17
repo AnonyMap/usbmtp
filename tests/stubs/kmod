@@ -9,6 +9,7 @@ case "$me" in
   insmod)
     name="$(basename "$1" .ko)"
     [ -e "$F/fail_insmod_$name" ] && exit 1
+    [ -e "$F/fail_insmod_with_params_$name" ] && [ $# -gt 2 ] && exit 1 # (defaults: path + one option)
     grep -q "^$name " "$F/proc/modules" || echo "$name 1000 0 - Live 0x0" >>"$F/proc/modules"
     if [ "$name" = g_mass_storage ]; then
       L=/sys/devices/soc0/ci_hdrc.0/gadget/lun0/file

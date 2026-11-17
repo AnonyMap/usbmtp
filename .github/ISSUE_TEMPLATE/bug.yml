@@ -1,0 +1,58 @@
+name: Something doesn't work
+description: Report a problem with the plugin
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. The details below make it much easier to find the cause.
+        For a security problem, please don't open a public issue: see the Security section of the README.
+  - type: input
+    id: kindle
+    attributes:
+      label: Kindle model
+      description: "For example: Kindle 10th generation (2019), Paperwhite 10th generation"
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Kindle firmware
+      description: "Kindle settings → Device info (for example 5.16.8)"
+  - type: input
+    id: versions
+    attributes:
+      label: Plugin and KOReader versions
+      description: "Plugin: Tools → USB file transfer → About. KOReader: ☰ menu → Help → Version"
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options:
+        - MTP
+        - USB drive
+    validations:
+      required: true
+  - type: input
+    id: computer
+    attributes:
+      label: Computer
+      description: "For example: macOS 15 with Finder, Windows 11 Explorer, Fedora KDE with Dolphin, Calibre 8"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you saw instead (exact messages help).
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Exit KOReader, then copy these two files from koreader/plugins/usbmtp.koplugin/mtp/ on the Kindle and paste or attach them:
+        mtp.log and umtprd-last.log. (They list file names from the Kindle; its serial number is hidden. Remove any names you'd rather not share.)
+      render: text

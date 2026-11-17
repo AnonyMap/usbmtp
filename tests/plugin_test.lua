@@ -75,6 +75,7 @@ package.preload["ui/widget/container/widgetcontainer"] = function()
 local refreshed = 0
 package.loaded["apps/filemanager/filemanager"] = { instance = { onRefresh=function() refreshed = refreshed+1 end } }
 local saved, homed = 0, 0
+local edited_at_close
 local ReaderUI = { instance = nil }
 package.loaded["apps/reader/readerui"] = ReaderUI
 local BOOK = "/tmp/kmtp-test/fake/book.epub"
@@ -83,7 +84,7 @@ local function openBook()
   local r
   r = { kind="ReaderUI", document = { file = BOOK }, saveSettings=function() saved = saved+1 end,
     handleEvent=function() end,
-    onHome=function() homed = homed+1; UIManager:close(r); ReaderUI.instance = nil end }
+    onHome=function() edited_at_close = r.document.is_edited; homed = homed+1; UIManager:close(r); ReaderUI.instance = nil end }
   ReaderUI.instance = r
   table.insert(shown, 1, r)   -- the reader sits at the bottom of the window stack
 end
@@ -93,8 +94,11 @@ Plugin.path = "/tmp/kmtp-test/plugin/usbmtp.koplugin"
 local menu_items = {}
 local function mkui(doc) return { menu = { registerToMainMenu=function(_, p) p:addToMainMenu(menu_items) end }, document=doc } end
 local function udc(s) local f=io.open("/sys/class/udc/ci_hdrc.0/state","w"); f:write(s.."\n"); f:close() end
+local fake_pid -- (only the current daemon's: a stale one could match a recycled pid)
 local function fakeProcStat(state)
   local pid = io.open("/var/tmp/kmtp/umtprd.pid"):read("*l")
+  if fake_pid and fake_pid ~= pid then os.execute("rm -rf /proc/"..fake_pid) end
+  fake_pid = pid
   os.execute("mkdir -p /proc/"..pid); local f=io.open("/proc/"..pid.."/stat","w"); f:write(pid.." (umtprd) "..state.." 1 1\n"); f:close() end
 local function modules() local f=io.open("/proc/modules"); local s=f:read("*a"); f:close(); return (s:gsub(" [^\n]*",""):gsub("\n"," ")) end
 local function top() return shown[#shown] end
@@ -114,6 +118,8 @@ check(saved == 1, "book's settings saved exactly once before sharing")
 check(top().flush_events_on_show == true, "taps made during start are flushed")
 check(top().kind=="ConfirmBox" and top().dismissable==false and top().ok_text=="Hide" and top().cancel_text=="Stop", "dialog with Hide + Stop")
 check(modules():find("usb_f_fs") ~= nil, "MTP gadget up")
+local PS = require("pluginshare")
+check(PS.pause_auto_suspend == true and PS.keepalive == true, "kept awake while sharing (AutoSuspend paused, and its Kindle timer left alone)")
 
 local wp = io.open("/var/tmp/kmtp/watcher.pid"); check(wp ~= nil, "crash watcher started with KOReader's pid"); if wp then wp:close() end
 
@@ -133,8 +139,10 @@ check(Ctl.dialog == nil and not (top() and top().kind=="ConfirmBox"), "dialog no
 
 print("== C. computer overwrites the open book (with a dictionary popup open)")
 local popup = { kind="DictQuickLookup", text="popup" }; UIManager:show(popup)
+ReaderUI.instance.document.is_edited = true -- e.g. a highlight made meanwhile
 os.execute("echo 'newer version of the book' >> "..BOOK); runTasks(); runTasks()
 check(homed == 1 and ReaderUI.instance == nil, "book closed back to file browser")
+check(edited_at_close == false, "closed without writing the old copy back over the new one")
 local still = false; for _, w in ipairs(shown) do if w == popup then still = true end end
 check(not still, "popup above the reader closed before the book")
 check(top().kind=="InfoMessage" and top().text:find("changed from the computer"), "explained why")
@@ -162,6 +170,7 @@ print("== E. unplug from inside a book auto-stops")
 openBook(); Ctl:rememberOpenBook(); udc("not attached"); runTasks(); runTasks()
 check(not Ctl.active and modules():find("g_mass_storage"), "stopped, stock driver back")
 check(ReaderUI.instance ~= nil, "book left open")
+check(not PS.pause_auto_suspend and not PS.keepalive, "keep-awake undone after stopping")
 
 print("== F. KOReader exits while sharing (from a book)")
 startNow(); Device.exit(Device)
@@ -170,9 +179,23 @@ check(exited == 1 and not Ctl.active and modules():find("g_mass_storage") and no
 print("== G. prompt on plug-in from inside a book")
 settings.usbmtp_prompt_on_plug = true; udc("not attached"); rp2:onCharging(); runTasks(2); udc("configured"); runTasks()
 check(top().kind=="ConfirmBox" and top().text:find("Computer detected"), "offered from inside the book")
-top().ok_callback(); runTasks(); fakeProcStat("S")
+local pr = top(); UIManager:close(pr); pr.ok_callback(); runTasks(); fakeProcStat("S") -- (a ConfirmBox closes itself first)
 check(Ctl.active, "started from the prompt")
 Ctl:stop()
+local function promptsShown() local n = 0; for _, x in ipairs(shown) do if (x.text or ""):find("^Computer detected") then n = n + 1 end end; return n end
+udc("not attached"); rp2:onCharging(); runTasks(2); udc("configured"); runTasks()
+udc("not attached"); rp2:onCharging(); runTasks(2); udc("configured"); runTasks()
+check(promptsShown() == 1, "plugged in twice: one prompt, not two stacked")
+PS.keepalive = true -- the KeepAlive plugin is on
+startNow()
+check(promptsShown() == 0 and Ctl.active, "started from the menu instead: the prompt goes")
+Ctl:stop()
+check(PS.keepalive == true, "KeepAlive's own setting is left as it was")
+PS.keepalive = nil
+udc("not attached"); rp2:onCharging(); runTasks(2); udc("configured"); runTasks()
+check(promptsShown() == 1, "prompt again")
+udc("not attached"); rp2:onNotCharging()
+check(promptsShown() == 0, "unplugged: the prompt goes")
 
 print("== H. charger is ignored")
 udc("powered"); local n = #shown; rp2:onCharging(); runTasks(20)
@@ -294,8 +317,7 @@ check(#opened == 1 and opened[1].file == "/mnt/us/documents/Sci-Fi/Dune - Frank 
   and opened[1].ui == (ReaderUI.instance or package.loaded["apps/filemanager/filemanager"].instance), "Open opens it from wherever we are")
 check(#shown == i0 - 1, "and closes the message")
 os.remove("/mnt/base-us/documents/metadata.calibre"); os.remove("/mnt/base-us/documents/cover.jpg")
-local rf = io.open("/tmp/kmtp-test/plugin/usbmtp.koplugin/mtp/received.txt"):read("*a")
-check(("\n" .. rf):find("\n/mnt/us/documents/Sci%-Fi/Dune"), "paths given as /mnt/us (what KOReader uses)")
+check(io.open("/tmp/kmtp-test/plugin/usbmtp.koplugin/mtp/received.txt") == nil, "the list is deleted once shown (not shown again next time)")
 O.callback(); fakeProcStat("S"); d = top(); UIManager:close(d); d.cancel_callback()
 check(top().text:find("Safe to unplug") and not top().text:find("new file") and top().timeout == 4, "nothing new: plain message that times out")
 
@@ -412,6 +434,7 @@ settings.usbmtp_on_plug = nil
 
 print("== Z. USB drive mode (Mac/Windows, no app)")
 local Drive = require("usbmtp_drive")
+local Fat0 = require("usbmtp_fat")
 local IMG = Drive.IMAGE
 local DOCS = "/mnt/base-us/documents"
 -- os.execute: 0 in Lua 5.1 mode, true/"exit"/0 in a LuaJIT built with 5.2 compat
@@ -520,7 +543,7 @@ onDrive("Blocked.epub", "b"); onDrive("Fine.epub", "f")
 eject(); runTasks()
 check(readf(DOCS .. "/Fine.epub") == "f", "the other book is copied")
 check(top().text:find("1 file%(s%) couldn't be copied") and top().text:find("Blocked.epub: a folder of that name is in the way"), "the failure is named, with why")
-check(Drive.pending(IMG) == 2, "drive not emptied (nothing lost)")
+check(Drive.pending(IMG) == 1 and Fat0.open(IMG):list()[2], "drive not emptied (nothing lost); only the failed one counts as waiting")
 os.execute("rmdir " .. DOCS .. "/Blocked.epub")
 CtlM:start(); udc("configured"); runTasks(); eject(); runTasks()
 check(readf(DOCS .. "/Blocked.epub") == "b" and top().text:find("1 file%(s%) were already on the Kindle") and Drive.pending(IMG) == 0,
@@ -565,6 +588,44 @@ local rK; rK = { kind = "ReaderUI", document = { file = "/mnt/us/documents/dune2
 ReaderUI.instance = rK; table.insert(shown, 1, rK)
 CtlM:start(); udc("configured"); runTasks(); onDrive("Dune2.epub", "new"); eject(); runTasks()
 check(readf(DOCS .. "/Dune2.epub") == "new" and homed == homedK + 1, "the open book matched case-insensitively (vfat) and closed before replacing")
+
+print("== Z8. a drive never supplies KOReader's own files")
+clearShown(); udc("not attached")
+CtlM:start(); udc("configured"); runTasks()
+assert(sh0("mmd -i " .. IMG .. "@@1M ::Book.sdr ::koreader ::Note.sdrZ"))
+onDrive("Book.sdr/metadata.epub.lua", "return {}"); onDrive("koreader/settings.reader.lua", "os.exit()")
+onDrive("evil.LUA", "x"); onDrive("Trick.luaQ", "x"); onDrive("Note.sdrZ/x.epub", "x"); onDrive("Real.epub", "r")
+do -- vfat drops trailing dots and spaces: make the names "Trick.lua." and "Note.sdr " (mtools won't write them)
+  local data = readf(IMG)
+  local h = io.open(IMG, "r+b")
+  for _, sub in ipairs({ { "a\0Q\0", "a\0.\0" }, { "r\0Z\0", "r\0 \0" } }) do
+    local i = data:find(sub[1], 1, true); assert(i, "patch"); h:seek("set", i - 1); h:write(sub[2])
+  end
+  h:close()
+end
+local names = {}; for _, f in ipairs(Fat0.open(IMG):list()) do names[f.path] = true end
+assert(names["Trick.lua."] and names["Note.sdr /x.epub"], "names patched")
+eject(); runTasks()
+local found = io.popen("cd " .. DOCS .. " && find . -iname '*.lua*' -o -iname '*.sdr*' -o -iname 'koreader' -o -iname 'Trick*'"):read("*a")
+check(readf(DOCS .. "/Real.epub") == "r" and found:gsub("%./Old%.sdr[^\n]*\n", "") == "", "only the book is copied: no .lua, no .sdr, however spelled (" .. found:gsub("\n", " ") .. ")")
+check(top().text:find("5 file%(s%) of KOReader's own"), "and the summary says why the rest weren't")
+check(Drive.pending(IMG) == 0, "drive emptied")
+
+print("== Z9. a stopped import never brings back a book deleted since; the rest are offered on the next start")
+clearShown(); CtlM:start(); udc("configured"); runTasks()
+os.execute("mkdir -p " .. DOCS .. "/Stuck.epub")
+onDrive("Kept.epub", "k"); onDrive("Stuck.epub", "s")
+eject(); runTasks()
+check(readf(DOCS .. "/Kept.epub") == "k" and Drive.pending(IMG) == 1, "one added, one waits")
+os.remove(DOCS .. "/Kept.epub"); os.execute("rmdir " .. DOCS .. "/Stuck.epub") -- deleted on the Kindle meanwhile
+clearShown(); CtlM.stale_checked = nil; P3:new{ ui = mkui(nil) }; runTasks(3) -- KOReader started again
+check(top() and top().kind == "ConfirmBox" and top().text:find("^1 file%(s%) copied to the USB drive last time"), "next start: offered")
+top().ok_callback(); runTasks()
+check(readf(DOCS .. "/Stuck.epub") == "s" and not readf(DOCS .. "/Kept.epub"), "the waiting one is added; the deleted one stays deleted")
+check(top().kind == "ButtonDialog" and top().text:find("1 new book"), "and reported")
+check(Drive.pending(IMG) == 0 and not readf(IMG .. ".imported"), "drive emptied, its list gone")
+clearShown(); CtlM.stale_checked = nil; P3:new{ ui = mkui(nil) }; runTasks(3)
+check(#shown == 0, "nothing waiting: no offer")
 
 print("== Z5. erasing a drive that still has books asks first; the prompt names the mode")
 clearShown(); udc("not attached")
